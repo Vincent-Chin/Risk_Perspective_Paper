@@ -22,6 +22,9 @@ def populate_data(symbols, data_directory, initial_date, final_date):
     if not os.path.exists(data_directory + "signals/"):
         os.mkdir(data_directory + "signals/")
 
+    if not os.path.exists(data_directory + "performances/"):
+        os.mkdir(data_directory + "performances/")
+
     response_data = {}
     for symbol in symbols:
         filename = data_directory + symbol + '.csv'
@@ -73,6 +76,8 @@ def performance_report(rets, bench_returns):
                                     pd.Timestamp(grouped.index[len(grouped) - 1]).date())
     stats['annPL'] = (stats.rawPL / stats.days) * 252
     stats['annSD'] = stats.sdPL * math.sqrt(252)
+
+    stats['trades'] = len(temp)
 
     negonly = grouped.copy()
     negonly[negonly > 0] = 0
@@ -148,11 +153,14 @@ def main():
         'MA20_Mode': ('>', '<'),
         'MA200_Mode': ('>', '<'),
     }
+    objective_metrics = ['Sharpe', 'Sortino', 'MAR', 'Info']
+    wf_lookback = 100
 
     # --- 2. COMPUTE STUDIES ---
-    effect_start = np.busday_offset(initial_date, -200)
+    effect_start = np.busday_offset(initial_date, -200 - wf_lookback - 1)
     data = populate_data(symbols, data_directory, effect_start, final_date)
 
+    # for each stock
     for ticker in data:
         this_data = data[ticker]  # by reference
         # these require a negative-1 shift because we only know up to the prior close.
@@ -165,10 +173,12 @@ def main():
         # this is used for comparison purposes so no adjustment is needed.
         this_data['Return'] = (this_data.AdjClose - this_data.AdjClose.shift(1)) / this_data.AdjClose.shift(1)
 
+    # for our benchmark data
     temp = populate_data([benchmark], data_directory, effect_start, final_date)
     bench_data = temp[benchmark]
     bench_returns = (bench_data.AdjClose - bench_data.AdjClose.shift(1)) / bench_data.AdjClose.shift(1)
     bench_returns.columns = ['Return']
+    bench_returns.index = pd.to_datetime(bench_returns.index)
 
     # --- 3. ENUMERATE SEARCH UNIVERSE ---
     combos = dict_product(search_parameters)
@@ -191,8 +201,68 @@ def main():
             filenames[str(combo)] = filename
 
     # --- 5. CONDUCT WALK-FORWARD ENUMERATION ---
-    objective_metrics = ['Sharpe', 'Sortino', 'MAR', 'Info']
+    test_dates = pd.bdate_range(initial_date, final_date)
 
+    insample_sets = {}
+    insample_trades = {}
+    outsample_trades = {}
+    for metric in objective_metrics:
+        insample_sets[metric] = pd.DataFrame(index=test_dates, columns=['Combo'])
+        insample_trades[metric] = pd.DataFrame()
+        outsample_trades[metric] = pd.DataFrame()
+
+    for trade_date in test_dates:
+        first_date = np.busday_offset(trade_date.date(), -wf_lookback - 1)   # first date of calibration period
+        last_date = np.busday_offset(trade_date.date(), - 1)                 # last date of calibration period
+
+        # go through each combination and aggregate the performances
+        perf_file = data_directory + "performances/" + str(trade_date.date()) + ".csv"
+        if os.path.exists(perf_file):
+            performances = pd.read_csv(perf_file, index_col=0)
+        else:
+            performances = pd.DataFrame()
+            for combo in filenames:
+                this_signals = pd.read_csv(filenames[combo], index_col=0, parse_dates=True)
+                if len(this_signals) > 0:
+                    this_signals = this_signals[(this_signals.index.date >= first_date)
+                                                & (this_signals.index.date <= last_date)]
+                    this_benchmark = bench_returns[(bench_returns.index.date >= first_date)
+                                                    & (bench_returns.index.date <= last_date)]
+                    if len(this_signals) > 0:
+                        this_performance, this_cumpl = performance_report(this_signals.Return, this_benchmark)
+                        this_performance.index = [str(combo)]
+                        performances = performances.append(this_performance)
+            performances.to_csv(perf_file)
+
+        # sort by our objective metrics.  ignore results with <30 trades or with infinite ratios or negative PL.
+        for metric in objective_metrics:
+            subset_perfs = performances.sort_values([metric], ascending=False).copy()
+            subset_perfs = subset_perfs[(subset_perfs.trades >= 30)
+                                        & (np.isinf(subset_perfs[metric]) == False)
+                                        & (subset_perfs.rawPL > 0)]
+            if len(subset_perfs) >= 1:
+                best_perf = subset_perfs.sort_values([metric], ascending=False).iloc[0].copy()
+                combo = best_perf.name
+                filename = data_directory + "signals/" + str(combo).replace(" ", "").replace(",", "_") \
+                    .replace("'", "").replace(":", "-").replace("<", "L").replace(">", "G").replace("=", "E") + ".csv"
+                best_trades = pd.read_csv(filename, index_col=0)
+
+                insample_sets[metric].loc[trade_date, 'Combo'] = best_perf.name
+                insample_trades[metric] = insample_trades[metric].append(
+                    best_trades[pd.to_datetime(best_trades.index).date == last_date])
+                outsample_trades[metric] = outsample_trades[metric].append(
+                    best_trades[pd.to_datetime(best_trades.index).date == trade_date])
+
+                # write out identified information for manual verification purposes
+                insample_sets[metric].to_csv(data_directory + "performances/" + metric + "_sets.csv")
+                insample_trades[metric].to_csv(data_directory + "performances/" + metric + "_intrades.csv")
+                outsample_trades[metric].to_csv(data_directory + "performances/" + metric + "_outtrades.csv")
+
+    # --- 6. GENERATE COMPARATIVE PERFORMANCES FOR ALL OF OUR METRICS ---
+    final_perfs = pd.DataFrame()
+    for metric in objective_metrics:
+        insample_perf, insample_pl = performance_report(insample_trades[metric].Return, bench_returns)
+        outsample_perf, outsample_pl = performance_report(outsample_trades[metric].Return, bench_returns)
 
     return
 
