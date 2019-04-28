@@ -4,6 +4,7 @@ import os
 import itertools as it
 import operator
 import math
+import datetime as dt
 
 import pull_history as ph
 
@@ -105,9 +106,10 @@ def performance_report(rets, bench_returns):
 
 
 ###########
-# MAIN LOGIC
+# EXPERIMENT CODE - MAIN LOGIC
 ###########
-def main():
+def do_experiment(symbols: list, data_directory: str, initial_date: str, final_date: str, benchmark: str,
+                  search_parameters: dict, objective_metrics: list, wf_lookback: int):
     # PROCESS
     # -------
     # 1. stage data - pull from csvs
@@ -127,34 +129,6 @@ def main():
     #   a. generate a performance comparison with some descriptive statistics for each
     #   b. plot the cumulative PLs on a graph
     #
-
-    # --- 1. INITIALIZATION ---
-    # https://en.wikipedia.org/wiki/S%26P_100 - snapshot 4/27/2019
-    # excludes (data retrieval failure): 'BRK.B', 'DOW', 'FOX', 'FOXA',
-    symbols = ['AAPL', 'ABBV', 'ABT', 'ACN', 'AGN', 'AIG', 'ALL', 'AMGN', 'AMZN', 'AXP',
-               'BA', 'BAC', 'BIIB', 'BK', 'BKNG', 'BLK', 'BMY', 'C', 'CAT',
-               'CELG', 'CHTR', 'CL', 'CMCSA', 'COF', 'COP', 'COST', 'CSCO', 'CVX', 'DHR',
-               'DIS', 'DUK', 'DWDP', 'EMR', 'EXC', 'F', 'FB', 'FDX',
-               'GD', 'GE', 'GILD', 'GM', 'GOOG', 'GOOGL', 'GS', 'HD', 'HON',
-               'IBM', 'INTC', 'JNJ', 'JPM', 'KHC', 'KMI', 'KO', 'LLY', 'LMT', 'LOW',
-               'MA', 'MCD', 'MDLZ', 'MDT', 'MET', 'MMM', 'MO', 'MRK', 'MS', 'MSFT',
-               'NEE', 'NFLX', 'NKE', 'NVDA', 'ORCL', 'OXY', 'PEP', 'PFE', 'PG', 'PM',
-               'PYPL', 'QCOM', 'RTN', 'SBUX', 'SLB', 'SO', 'SPG', 'T', 'TGT', 'TXN',
-               'UNH', 'UNP', 'UPS', 'USB', 'UTX', 'V', 'VZ', 'WBA', 'WFC', 'WMT',
-               'XOM'
-               ]
-    data_directory = './data/'
-    initial_date = "2014-01-01"
-    final_date = "2018-12-31"
-    benchmark = 'SPY'
-    search_parameters = {
-        'MA20_Std': np.arange(-2.5, 2.5, 0.5),
-        'MA200_Std': np.arange(-2.5, 2.5, 0.5),
-        'MA20_Mode': ('>', '<'),
-        'MA200_Mode': ('>', '<'),
-    }
-    objective_metrics = ['Sharpe', 'Sortino', 'MAR', 'Info']
-    wf_lookback = 100
 
     # --- 2. COMPUTE STUDIES ---
     effect_start = np.busday_offset(initial_date, -200 - wf_lookback - 1)
@@ -212,6 +186,7 @@ def main():
         outsample_trades[metric] = pd.DataFrame()
 
     for trade_date in test_dates:
+        print(dt.datetime.now(), "Conducting experiment on ", trade_date)
         first_date = np.busday_offset(trade_date.date(), -wf_lookback - 1)   # first date of calibration period
         last_date = np.busday_offset(trade_date.date(), - 1)                 # last date of calibration period
 
@@ -241,7 +216,7 @@ def main():
                                         & (np.isinf(subset_perfs[metric]) == False)
                                         & (subset_perfs.rawPL > 0)]
             if len(subset_perfs) >= 1:
-                best_perf = subset_perfs.sort_values([metric], ascending=False).iloc[0].copy()
+                best_perf = subset_perfs.iloc[0].copy()
                 combo = best_perf.name
                 filename = data_directory + "signals/" + str(combo).replace(" ", "").replace(",", "_") \
                     .replace("'", "").replace(":", "-").replace("<", "L").replace(">", "G").replace("=", "E") + ".csv"
@@ -251,7 +226,7 @@ def main():
                 insample_trades[metric] = insample_trades[metric].append(
                     best_trades[pd.to_datetime(best_trades.index).date == last_date])
                 outsample_trades[metric] = outsample_trades[metric].append(
-                    best_trades[pd.to_datetime(best_trades.index).date == trade_date])
+                    best_trades[pd.to_datetime(best_trades.index).date == trade_date.date()])
 
                 # write out identified information for manual verification purposes
                 insample_sets[metric].to_csv(data_directory + "performances/" + metric + "_sets.csv")
@@ -260,9 +235,65 @@ def main():
 
     # --- 6. GENERATE COMPARATIVE PERFORMANCES FOR ALL OF OUR METRICS ---
     final_perfs = pd.DataFrame()
+    insample_pls = {}
+    outsample_pls = {}
     for metric in objective_metrics:
-        insample_perf, insample_pl = performance_report(insample_trades[metric].Return, bench_returns)
-        outsample_perf, outsample_pl = performance_report(outsample_trades[metric].Return, bench_returns)
+        if len(insample_trades[metric]) > 0:
+            insample_perf, insample_pl = performance_report(insample_trades[metric].Return, bench_returns)
+            insample_perf.index = [(metric, "insample")]
+            final_perfs = final_perfs.append(insample_perf)
+            insample_pls[metric] = insample_pl
+        if len(outsample_trades[metric]) > 0:
+            outsample_perf, outsample_pl = performance_report(outsample_trades[metric].Return, bench_returns)
+            outsample_perf.index = [(metric, "outsample")]
+            final_perfs = final_perfs.append(outsample_perf)
+            outsample_pls[metric] = outsample_pl
+
+    print(dt.datetime.now(), "Experiment complete.")
+
+    return final_perfs, insample_pls, outsample_pls
+
+
+###########
+# MAIN() - FUNCTIONAL SCAFFOLDING
+###########
+def main():
+
+    # --- 1. INITIALIZATION ---
+    # https://en.wikipedia.org/wiki/S%26P_100 - snapshot 4/27/2019
+    # excludes (data retrieval failure): 'BRK.B', 'DOW', 'FOX', 'FOXA',
+    symbols = ['AAPL', 'ABBV', 'ABT', 'ACN', 'AGN', 'AIG', 'ALL', 'AMGN', 'AMZN', 'AXP',
+               'BA', 'BAC', 'BIIB', 'BK', 'BKNG', 'BLK', 'BMY', 'C', 'CAT',
+               'CELG', 'CHTR', 'CL', 'CMCSA', 'COF', 'COP', 'COST', 'CSCO', 'CVX', 'DHR',
+               'DIS', 'DUK', 'DWDP', 'EMR', 'EXC', 'F', 'FB', 'FDX',
+               'GD', 'GE', 'GILD', 'GM', 'GOOG', 'GOOGL', 'GS', 'HD', 'HON',
+               'IBM', 'INTC', 'JNJ', 'JPM', 'KHC', 'KMI', 'KO', 'LLY', 'LMT', 'LOW',
+               'MA', 'MCD', 'MDLZ', 'MDT', 'MET', 'MMM', 'MO', 'MRK', 'MS', 'MSFT',
+               'NEE', 'NFLX', 'NKE', 'NVDA', 'ORCL', 'OXY', 'PEP', 'PFE', 'PG', 'PM',
+               'PYPL', 'QCOM', 'RTN', 'SBUX', 'SLB', 'SO', 'SPG', 'T', 'TGT', 'TXN',
+               'UNH', 'UNP', 'UPS', 'USB', 'UTX', 'V', 'VZ', 'WBA', 'WFC', 'WMT',
+               'XOM'
+               ]
+    data_directory = './data/'
+    initial_date = "2014-01-01"
+    final_date = "2018-12-31"
+    benchmark = 'SPY'
+    search_parameters = {
+        'MA20_Std': np.arange(-2.5, 2.5, 0.5),
+        'MA200_Std': np.arange(-2.5, 2.5, 0.5),
+        'MA20_Mode': ('>', '<'),
+        'MA200_Mode': ('>', '<'),
+    }
+    objective_metrics = ['Sharpe', 'Sortino', 'MAR', 'Info']
+    wf_lookback = 100
+
+    # --- 2. Conduct experiment.  See do_experiment() code for step details.
+    final_perfs, insample_pls, outsample_pls = do_experiment(symbols, data_directory, initial_date, final_date,
+                                                             benchmark, search_parameters, objective_metrics,
+                                                             wf_lookback)
+
+    # --- 3. Plot and visualize.
+
 
     return
 
