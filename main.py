@@ -6,10 +6,10 @@ import operator
 import math
 import datetime as dt
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import pathos.multiprocessing as mp
 
 import pull_history as ph
+import monte_carlo as mc
 
 pd.options.display.max_rows = 999
 pd.options.display.max_columns = 999
@@ -28,6 +28,9 @@ def populate_data(symbols, data_directory, initial_date, final_date):
 
     if not os.path.exists(data_directory + "performances/"):
         os.mkdir(data_directory + "performances/")
+
+    if not os.path.exists(data_directory + "mc_performances/"):
+        os.mkdir(data_directory + "mc_performances/")
 
     response_data = {}
     for symbol in symbols:
@@ -85,7 +88,8 @@ def performance_report(rets, bench_returns):
 
     negonly = grouped.copy()
     negonly[negonly > 0] = 0
-    stats['semiannsd'] = np.std(negonly) * math.sqrt(252)
+    stats['semisd'] = np.std(negonly)
+    stats['semiannsd'] = stats.semisd * math.sqrt(252)
 
     cum_pl = np.cumsum(grouped)
     dd = cum_pl - cum_pl.cummax()
@@ -103,7 +107,10 @@ def performance_report(rets, bench_returns):
     benchstats['sdInfo'] = np.std(vsBench)
     benchstats['annInfo'] = (benchstats.rawInfo / stats.days) * 252
     benchstats['annsdInfo'] = benchstats.sdInfo * math.sqrt(252)
-    stats['Info'] = benchstats.annInfo / benchstats.annsdInfo
+
+    stats['annInfo'] = benchstats.annInfo
+    stats['annsdInfo'] = benchstats.annsdInfo
+    stats['InfoRatio'] = stats.annInfo / stats.annsdInfo
 
     return stats, cum_pl
 
@@ -111,6 +118,104 @@ def performance_report(rets, bench_returns):
 ###########
 # EXPERIMENT CODE - MAIN LOGIC
 ###########
+def wf_step(trade_date, wf_lookback, data_directory, filenames, objective_metrics, bench_returns, is_mc,
+            mc_iterations=50):
+    print(dt.datetime.now(), "Conducting experiment on", trade_date, "; monte carlo:", is_mc)
+
+    insample_sets = {}
+    insample_trades = {}
+    outsample_trades = {}
+    for metric in objective_metrics:
+        insample_sets[metric] = pd.DataFrame(index=[trade_date], columns=['Combo'])
+        insample_trades[metric] = pd.DataFrame()
+        outsample_trades[metric] = pd.DataFrame()
+
+    first_date = np.busday_offset(trade_date.date(), -wf_lookback - 1)  # first date of calibration period
+    last_date = np.busday_offset(trade_date.date(), - 1)  # last date of calibration period
+
+    # go through each combination and aggregate the performances
+    if not is_mc:
+        perf_file = data_directory + "performances/" + str(trade_date.date()) + ".csv"
+    else:
+        perf_file = data_directory + "performances/mc_" + str(trade_date.date()) + ".csv"
+
+    if os.path.exists(perf_file):
+        performances = pd.read_csv(perf_file, index_col=0)
+    else:
+        # we have two modes here, traditional, and monte carlo.  in traditional we just do a straight backtest over
+        # the test period for each combo's performance (up to the trade date), and then record the performance.
+        #
+        # monte carlo differs in that we're first going to generate n samples of dates, and then extract signals
+        # corresponding to those dates and run a performance for each of those combos.  we then average all of those
+        # performances to determine the performance for the overall combo.
+        mc_samples = []
+        if is_mc:
+            sampling_frame = pd.DataFrame(index=pd.bdate_range(first_date, last_date))
+            for n in range(0, mc_iterations):
+                mc_samples.append(mc.montecarlo_sample(sampling_frame, 5))
+
+        performances = pd.DataFrame()
+        for combo in filenames:
+            this_signals = pd.read_csv(filenames[combo], index_col=0, parse_dates=True)
+            if len(this_signals) > 0:
+                this_signals = this_signals[(this_signals.index.date >= first_date)
+                                            & (this_signals.index.date <= last_date)]
+                this_benchmark = bench_returns[(bench_returns.index.date >= first_date)
+                                               & (bench_returns.index.date <= last_date)]
+
+                if len(this_signals) > 0:
+                    if not is_mc:
+                        # if doing traditional execution, just pull out trades from the test period
+                        this_performance, this_cumpl = performance_report(this_signals.Return, this_benchmark)
+                        this_performance.index = [str(combo)]
+                        performances = performances.append(this_performance)
+                    else:
+                        # if doing monte carlo execution, we need to repeatedly sample trades and then average all of
+                        # the performances.
+                        sample_performances = pd.DataFrame()
+                        for this_sample in mc_samples:
+                            sample_signals = this_signals.loc[this_signals.index.isin(this_sample.index)]
+                            if len(sample_signals) > 0:
+                                this_performance, this_cumpl = performance_report(sample_signals.Return, this_benchmark)
+                                sample_performances = sample_performances.append(this_performance, ignore_index=True)
+                            avg_performance = sample_performances.mean()
+                            avg_performance.name = str(combo)
+
+                            # recompute the derived stats using the PL info, rather than using the raw average.
+                            avg_performance['Sharpe'] = avg_performance.annPL / avg_performance.annSD
+                            avg_performance['Sortino'] = avg_performance.annPL / avg_performance.semiannsd
+                            avg_performance['MAR'] = avg_performance.annPL / abs(avg_performance.MaxDD)
+                            avg_performance['InfoRatio'] = avg_performance.annInfo / avg_performance.annsdInfo
+                            performances = performances.append(pd.DataFrame(avg_performance).transpose())
+        performances.to_csv(perf_file)
+
+    # sort by our objective metrics.  ignore results with <30 trades or with infinite ratios or negative PL.
+    for metric in objective_metrics:
+        subset_perfs = performances.sort_values([metric], ascending=False).copy()
+        subset_perfs = subset_perfs[(subset_perfs.trades >= 30)
+                                    & (np.isinf(subset_perfs[metric]) == False)
+                                    & (subset_perfs.rawPL > 0)]
+        if len(subset_perfs) >= 1:
+            best_perf = subset_perfs.iloc[0].copy()
+            combo = best_perf.name
+            filename = data_directory + "signals/" + str(combo).replace(" ", "").replace(",", "_") \
+                .replace("'", "").replace(":", "-").replace("<", "L").replace(">", "G").replace("=", "E") + ".csv"
+            best_trades = pd.read_csv(filename, index_col=0)
+
+            insample_sets[metric].loc[trade_date, 'Combo'] = best_perf.name
+            insample_trades[metric] = insample_trades[metric].append(
+                best_trades[pd.to_datetime(best_trades.index).date == last_date])
+            outsample_trades[metric] = outsample_trades[metric].append(
+                best_trades[pd.to_datetime(best_trades.index).date == trade_date.date()])
+
+            # write out identified information for manual verification purposes - doesn't work with multiprocessing
+            # insample_sets[metric].to_csv(data_directory + "performances/" + metric + "_sets.csv")
+            # insample_trades[metric].to_csv(data_directory + "performances/" + metric + "_intrades.csv")
+            # outsample_trades[metric].to_csv(data_directory + "performances/" + metric + "_outtrades.csv")
+
+    return insample_sets, insample_trades, outsample_trades
+
+
 def do_experiment(symbols: list, data_directory: str, initial_date: str, final_date: str, benchmark: str,
                   search_parameters: dict, objective_metrics: list, wf_lookback: int, is_mc: bool):
     # PROCESS
@@ -200,13 +305,13 @@ def do_experiment(symbols: list, data_directory: str, initial_date: str, final_d
             this_sets, this_in, this_out = wf_record[tdate]._value
             for metric in objective_metrics:
                 if metric not in insample_sets:
-                    insample_sets[metric] = this_sets
-                    insample_trades[metric] = this_in
-                    outsample_trades[metric] = this_out
+                    insample_sets = this_sets
+                    insample_trades = this_in
+                    outsample_trades = this_out
                 else:
-                    insample_sets[metric] = insample_sets[metric].append(this_sets)
-                    insample_trades[metric] = insample_trades[metric].append(this_in)
-                    outsample_trades[metric] = outsample_trades[metric].append(this_out)
+                    insample_sets[metric] = insample_sets[metric].append(this_sets[metric])
+                    insample_trades[metric] = insample_trades[metric].append(this_in[metric])
+                    outsample_trades[metric] = outsample_trades[metric].append(this_out[metric])
         else:
             print("Unexpected issue on", tdate, wf_record[tdate]._value)
 
@@ -225,79 +330,44 @@ def do_experiment(symbols: list, data_directory: str, initial_date: str, final_d
             outsample_perf.index = [(metric, "outsample")]
             final_perfs = final_perfs.append(outsample_perf)
             outsample_pls[metric] = outsample_pl
+        insample_pls[metric].index = pd.to_datetime(insample_pls[metric].index)
+        outsample_pls[metric].index = pd.to_datetime(outsample_pls[metric].index)
 
     print(dt.datetime.now(), "Experiment complete.")
 
-    return final_perfs, insample_pls, outsample_pls
+    return final_perfs, insample_pls, outsample_pls, bench_returns
 
 
-def wf_step(trade_date, wf_lookback, data_directory, filenames, objective_metrics, bench_returns, is_mc):
-    print(dt.datetime.now(), "Conducting experiment on", trade_date)
-
-    insample_sets = {}
-    insample_trades = {}
-    outsample_trades = {}
+def plot(objective_metrics, bench_returns, insample_pls, outsample_pls, is_mc):
+    # combine data into a single plottable dataframe
+    date_range = None
+    combined_frame = pd.DataFrame()
     for metric in objective_metrics:
-        insample_sets[metric] = pd.DataFrame(index=[trade_date], columns=['Combo'])
-        insample_trades[metric] = pd.DataFrame()
-        outsample_trades[metric] = pd.DataFrame()
+        if len(combined_frame) == 0:
+            date_range = pd.bdate_range(insample_pls[metric].index[0],
+                                        outsample_pls[metric].index[len(outsample_pls[metric]) - 1])
+            combined_frame = pd.DataFrame(index=date_range)
 
-    first_date = np.busday_offset(trade_date.date(), -wf_lookback - 1)  # first date of calibration period
-    last_date = np.busday_offset(trade_date.date(), - 1)  # last date of calibration period
+        combined_frame[(metric, "insample")] = insample_pls[metric]
+        combined_frame[(metric, "outsample")] = outsample_pls[metric]
 
-    # go through each combination and aggregate the performances
-    perf_file = data_directory + "performances/" + str(trade_date.date()) + ".csv"
-    if os.path.exists(perf_file):
-        performances = pd.read_csv(perf_file, index_col=0)
+    subset_benchmark = bench_returns[(bench_returns.index >= date_range[0])
+                                     & (bench_returns.index <= date_range[len(date_range) - 1])]
+    combined_frame['benchmark'] = np.cumsum(subset_benchmark)
+    combined_frame.ffill(inplace=True)
+
+    # plot
+    ax = combined_frame.plot(colormap='Paired')
+    ax.xaxis.grid()
+    ax.yaxis.grid()
+    ax.set_facecolor('black')
+    if not is_mc:
+        plt.title('Cumulative Returns')
     else:
-        performances = pd.DataFrame()
-        for combo in filenames:
-            this_signals = pd.read_csv(filenames[combo], index_col=0, parse_dates=True)
-            if not is_mc:
-                # if doing traditional execution, just pull out trades from the test period
-                if len(this_signals) > 0:
-                    this_signals = this_signals[(this_signals.index.date >= first_date)
-                                                & (this_signals.index.date <= last_date)]
-                    this_benchmark = bench_returns[(bench_returns.index.date >= first_date)
-                                                   & (bench_returns.index.date <= last_date)]
+        plt.title('Cumulative Returns - Monte Carlo')
+    plt.show()
 
-                    if len(this_signals) > 0:
-                        this_performance, this_cumpl = performance_report(this_signals.Return, this_benchmark)
-                        this_performance.index = [str(combo)]
-                        performances = performances.append(this_performance)
-            else:
-                # TODO: implement monte carlo
-                # if doing monte carlo execution, we need to repeatedly sample trades and then average all of the
-                # performances.
-                for n in range(0, 50):
-                    pass
-        performances.to_csv(perf_file)
-
-    # sort by our objective metrics.  ignore results with <30 trades or with infinite ratios or negative PL.
-    for metric in objective_metrics:
-        subset_perfs = performances.sort_values([metric], ascending=False).copy()
-        subset_perfs = subset_perfs[(subset_perfs.trades >= 30)
-                                    & (np.isinf(subset_perfs[metric]) == False)
-                                    & (subset_perfs.rawPL > 0)]
-        if len(subset_perfs) >= 1:
-            best_perf = subset_perfs.iloc[0].copy()
-            combo = best_perf.name
-            filename = data_directory + "signals/" + str(combo).replace(" ", "").replace(",", "_") \
-                .replace("'", "").replace(":", "-").replace("<", "L").replace(">", "G").replace("=", "E") + ".csv"
-            best_trades = pd.read_csv(filename, index_col=0)
-
-            insample_sets[metric].loc[trade_date, 'Combo'] = best_perf.name
-            insample_trades[metric] = insample_trades[metric].append(
-                best_trades[pd.to_datetime(best_trades.index).date == last_date])
-            outsample_trades[metric] = outsample_trades[metric].append(
-                best_trades[pd.to_datetime(best_trades.index).date == trade_date.date()])
-
-            # write out identified information for manual verification purposes - doesn't work with multiprocessing
-            # insample_sets[metric].to_csv(data_directory + "performances/" + metric + "_sets.csv")
-            # insample_trades[metric].to_csv(data_directory + "performances/" + metric + "_intrades.csv")
-            # outsample_trades[metric].to_csv(data_directory + "performances/" + metric + "_outtrades.csv")
-
-    return insample_sets, insample_trades, outsample_trades
+    return
 
 
 ###########
@@ -321,7 +391,6 @@ def main():
                'XOM'
                ]
     data_directory = './data/'
-    mc_data_directory = './data_mc/'
     initial_date = "2014-01-01"
     final_date = "2018-12-31"
     benchmark = 'SPY'
@@ -331,24 +400,24 @@ def main():
         'MA20_Mode': ('>', '<'),
         'MA200_Mode': ('>', '<'),
     }
-    objective_metrics = ['Sharpe', 'Sortino', 'MAR', 'Info']
+    objective_metrics = ['Sharpe', 'Sortino', 'MAR', 'InfoRatio']
     wf_lookback = 100
     is_mc = False
+    mc_iterations = 50
 
     # --- 2. Conduct traditional experiment.  See do_experiment() code for step details.
-    final_perfs, insample_pls, outsample_pls = do_experiment(symbols, data_directory, initial_date, final_date,
-                                                             benchmark, search_parameters, objective_metrics,
-                                                             wf_lookback, is_mc=False)
+    final_perfs, insample_pls, outsample_pls, bench_returns = do_experiment(
+        symbols, data_directory, initial_date, final_date, benchmark, search_parameters, objective_metrics,
+        wf_lookback, is_mc=False)
+    plot(objective_metrics, bench_returns, insample_pls, outsample_pls, False)
+    print(final_perfs)
 
-    # --- 3. Plot and visualize.
-
-
-    # --- 4. Conduct monte carlo experiment.
-    '''
-    mc_final_perfs, mc_insample_pls, mc_outsample_pls = do_experiment(symbols, mc_data_directory, initial_date,
-                                                                      final_date, benchmark, search_parameters,
-                                                                      objective_metrics, wf_lookback, is_mc=True)
-    '''
+    # --- 3. Conduct monte carlo experiment.
+    mc_final_perfs, mc_insample_pls, mc_outsample_pls, mc_bench_returns = do_experiment(
+        symbols, data_directory, initial_date, final_date, benchmark, search_parameters, objective_metrics,
+        wf_lookback, is_mc=True)
+    plot(objective_metrics, bench_returns, mc_insample_pls, mc_outsample_pls, True)
+    print(mc_final_perfs)
 
     return
 
@@ -386,30 +455,4 @@ def debug_performance(data_directory, objective_metrics, bench_returns):
             outsample_perf.index = [(metric, "outsample")]
             final_perfs = final_perfs.append(outsample_perf)
             outsample_pls[metric] = outsample_pl
-
-    # combine data into a single plottable dataframe
-    date_range = None
-    combined_frame = pd.DataFrame()
-    for metric in objective_metrics:
-        if len(combined_frame) == 0:
-            date_range = pd.bdate_range(insample_pls[metric].index[0],
-                                        outsample_pls[metric].index[len(outsample_pls[metric]) - 1])
-            combined_frame = pd.DataFrame(index=date_range)
-
-        combined_frame[(metric, "insample")] = insample_pls[metric]
-        combined_frame[(metric, "outsample")] = outsample_pls[metric]
-
-    subset_benchmark = bench_returns[(bench_returns.index >= date_range[0])
-                                     & (bench_returns.index <= date_range[len(date_range) - 1])]
-    combined_frame['benchmark'] = np.cumsum(subset_benchmark)
-    combined_frame.ffill(inplace=True)
-
-    # plot
-    ax = combined_frame.plot(colormap='Paired')
-    ax.xaxis.grid()
-    ax.yaxis.grid()
-    ax.set_facecolor('black')
-    plt.title('Cumulative Returns')
-    plt.show()
-
     return

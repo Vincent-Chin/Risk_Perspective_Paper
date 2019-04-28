@@ -18,6 +18,8 @@ import time
 
 # constants
 TIINGO_API_Key = ""  # scrubbed.  replace with your own:  https://api.tiingo.com/
+if not TIINGO_API_Key:
+    print("TIINGO_API_KEY has been scrubbed.  Replace constant in pull_history.py.  https://api.tiingo.com/.")
 
 
 #######################################################################
