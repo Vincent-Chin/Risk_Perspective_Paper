@@ -158,7 +158,7 @@ def do_experiment(symbols: list, data_directory: str, initial_date: str, final_d
     temp = populate_data([benchmark], data_directory, effect_start, final_date)
     bench_data = temp[benchmark]
     bench_returns = (bench_data.AdjClose - bench_data.AdjClose.shift(1)) / bench_data.AdjClose.shift(1)
-    bench_returns.columns = ['Return']
+    bench_returns.name = 'Return'
     bench_returns.index = pd.to_datetime(bench_returns.index)
 
     # --- 3. ENUMERATE SEARCH UNIVERSE ---
@@ -216,6 +216,15 @@ def do_experiment(symbols: list, data_directory: str, initial_date: str, final_d
 
     # --- 6. GENERATE COMPARATIVE PERFORMANCES FOR ALL OF OUR METRICS ---
     final_perfs = pd.DataFrame()
+
+    # record benchmark performance
+    cropped_benchmark = bench_returns[(bench_returns.index.date >= pd.Timestamp(initial_date).date())
+                                      & (bench_returns.index.date <= pd.Timestamp(final_date).date())]
+    bench_perf, _ = performance_report(cropped_benchmark, bench_returns)
+    bench_perf.index = [("benchmark", benchmark)]
+    final_perfs = final_perfs.append(bench_perf)
+
+    # record strategy performance
     insample_pls = {}
     outsample_pls = {}
     for metric in objective_metrics:
@@ -310,7 +319,7 @@ def wf_step(trade_date, wf_lookback, data_directory, filenames, objective_metric
 
         performances.to_csv(perf_file)
 
-    # sort by our objective metrics.  ignore results with <30 trades or with infinite ratios or negative PL.
+    # sort by our objective metrics.  ignore results with too few trades or with infinite ratios or negative PL.
     for metric in objective_metrics:
         subset_perfs = performances.sort_values([metric], ascending=False).copy()
         subset_perfs = subset_perfs[(subset_perfs.trades >= 30)
